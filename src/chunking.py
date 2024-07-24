@@ -24,9 +24,9 @@ def chunk_text(text, max_tokens=100):
 if __name__ == "__main__":
     texts = ['data/textbook1.txt', 'data/textbook2.txt', 'data/textbook3.txt']
     for text_file in texts:
-        with open(text_file, 'r') as f:
+        with open(text_file, encoding="utf-8") as f:
             text = f.read()
         chunks = chunk_text(text)
-        with open(text_file.replace('.txt', '_chunks.txt'), 'w') as f:
+        with open(text_file.replace('.txt', '_chunks.txt'), 'w', encoding="utf-8") as f:
             for chunk in chunks:
                 f.write(chunk + '\n')

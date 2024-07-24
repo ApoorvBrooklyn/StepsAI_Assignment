@@ -9,7 +9,7 @@ def embed_chunks(chunks, model_name='all-MiniLM-L6-v2'):
 if __name__ == "__main__":
     texts = ['data/textbook1_chunks.txt', 'data/textbook2_chunks.txt', 'data/textbook3_chunks.txt']
     for text_file in texts:
-        with open(text_file, 'r') as f:
+        with open(text_file, 'r', encoding='utf-8') as f:
             chunks = f.readlines()
         embeddings = embed_chunks(chunks)
         np.save(text_file.replace('_chunks.txt', '_embeddings.npy'), embeddings)
