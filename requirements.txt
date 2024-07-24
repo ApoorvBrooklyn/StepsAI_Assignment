@@ -1,0 +1,10 @@
+textract
+PyMuPDF
+sentence-transformers
+scikit-learn
+openai
+pymilvus
+nltk
+spacy
+transformers
+streamlit
