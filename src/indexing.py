@@ -2,8 +2,14 @@ from sklearn.mixture import GaussianMixture
 import openai
 import numpy as np
 from pymilvus import connections, CollectionSchema, FieldSchema, DataType, Collection
+from sentence_transformers import SentenceTransformer
 
 openai.api_key = 'your_openai_api_key'
+
+def embed_chunks(chunks, model_name='all-MiniLM-L6-v2'):
+    model = SentenceTransformer(model_name)
+    embeddings = model.encode(chunks)
+    return embeddings
 
 def summarize_cluster(cluster_texts):
     prompt = "Summarize the following text:\n" + '\n'.join(cluster_texts)

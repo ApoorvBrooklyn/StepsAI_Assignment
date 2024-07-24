@@ -1,3 +1,8 @@
+import openai
+from retrieval import hybrid_retrieval
+
+openai.api_key = 'your_openai_api_key'
+
 def answer_question(query):
     retrieved_data = hybrid_retrieval(query)
     context = '\n'.join([data[0]['text'] for data in retrieved_data])
