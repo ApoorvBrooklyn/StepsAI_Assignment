@@ -1,24 +1,23 @@
 from sklearn.mixture import GaussianMixture
-import openai
 import numpy as np
 from pymilvus import connections, CollectionSchema, FieldSchema, DataType, Collection
-from sentence_transformers import SentenceTransformer
 
-openai.api_key = 'your_openai_api_key'
 
-def embed_chunks(chunks, model_name='all-MiniLM-L6-v2'):
-    model = SentenceTransformer(model_name)
-    embeddings = model.encode(chunks)
-    return embeddings
+from openai import OpenAI
+api_key='your_openai_api_key'
+client = OpenAI(api_key)
 
 def summarize_cluster(cluster_texts):
     prompt = "Summarize the following text:\n" + '\n'.join(cluster_texts)
-    response = openai.Completion.create(
-        engine="gpt-3.5-turbo",
-        prompt=prompt,
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ],
         max_tokens=150
     )
-    return response.choices[0].text.strip()
+    return response.choices[0].message.content.strip()
 
 def create_raptor_index(embeddings, chunks):
     gmm = GaussianMixture(n_components=10, covariance_type='full', random_state=42)
@@ -55,7 +54,7 @@ def store_in_milvus(embeddings, texts, metadata):
 if __name__ == "__main__":
     texts = ['data/textbook1_chunks.txt', 'data/textbook2_chunks.txt', 'data/textbook3_chunks.txt']
     for text_file in texts:
-        with open(text_file, 'r') as f:
+        with open(text_file, 'r', encoding='utf-8') as f:
             chunks = f.readlines()
         embeddings = np.load(text_file.replace('_chunks.txt', '_embeddings.npy'))
         summarized_embeddings, summarized_clusters = create_raptor_index(embeddings, chunks)
