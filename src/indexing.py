@@ -1,98 +1,55 @@
-# 
-from sklearn.mixture import GaussianMixture
-import numpy as np
-from pymilvus import connections, CollectionSchema, FieldSchema, DataType, Collection
-from openai import OpenAI
 import os
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from sklearn.mixture import GaussianMixture
 from dotenv import load_dotenv
+import traceback
+from transformers import pipeline
+import nltk
+from nltk.tokenize import sent_tokenize
 
-# Construct the path to the .env file
+# Download necessary NLTK data
+nltk.download('punkt')
+
+# Load environment variables
 dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
-
-# Load the .env file
 load_dotenv(dotenv_path)
 
-# Get the API key from the environment variables
-api_key = os.getenv('API_KEY')
+# Initialize models
+model = SentenceTransformer('all-MiniLM-L6-v2')
+summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
 
-print(f"API Key: {api_key}")  # Debug print, remove in production
+def create_faiss_index(embeddings):
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(embeddings.astype('float32'))
+    return index
 
-if not api_key:
-    raise ValueError("API key not found. Make sure it's set in your .env file.")
-
-# Initialize the OpenAI client
-client = OpenAI(api_key=api_key)
-
-import tiktoken
-
-def num_tokens_from_string(string: str, encoding_name: str = "cl100k_base") -> int:
-    """Returns the number of tokens in a text string."""
-    encoding = tiktoken.get_encoding(encoding_name)
-    num_tokens = len(encoding.encode(string))
-    return num_tokens
-
-def split_text(text, max_tokens=8000):
-    """Split text into chunks of approximately max_tokens tokens."""
-    chunks = []
-    current_chunk = []
-    current_size = 0
-    for sentence in text.split('.'):
-        sentence = sentence.strip() + '.'
-        sentence_size = num_tokens_from_string(sentence)
-        if current_size + sentence_size > max_tokens:
-            chunks.append('.'.join(current_chunk))
-            current_chunk = [sentence]
-            current_size = sentence_size
-        else:
-            current_chunk.append(sentence)
-            current_size += sentence_size
-    if current_chunk:
-        chunks.append('.'.join(current_chunk))
-    return chunks
-
-def summarize_cluster(cluster_texts):
+def summarize_cluster(cluster_texts, max_length=150):
+    # Join all texts in the cluster
     full_text = ' '.join(cluster_texts)
-    chunks = split_text(full_text)
-    summaries = []
     
-    for chunk in chunks:
-        prompt = f"Summarize the following text:\n{chunk}"
-        try:
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=150
-            )
-            summaries.append(response.choices[0].message.content.strip())
-        except Exception as e:
-            print(f"Error in summarize_cluster: {e}")
-            summaries.append("Error in summarization")
+    # Tokenize into sentences
+    sentences = sent_tokenize(full_text)
     
-    # Combine summaries
-    combined_summary = " ".join(summaries)
+    # Log the length of the text being summarized
+    print(f"Summarizing text of length: {len(full_text)}")
     
-    # Create a final summary if needed
-    if len(summaries) > 1:
-        try:
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": f"Provide a concise summary of the following text:\n{combined_summary}"}
-                ],
-                max_tokens=150
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"Error in final summarization: {e}")
-            return combined_summary
-    else:
-        return combined_summary
+    # If the text is short enough, return it as is
+    if len(full_text) <= max_length:
+        return full_text
     
+    # Ensure the input to the summarizer is within the model's maximum input length
+    max_input_length = 1024  # Adjust this based on the model's max length
+    if len(full_text) > max_input_length:
+        full_text = full_text[:max_input_length]
     
+    # Otherwise, use the summarization pipeline
+    summary = summarizer(full_text, max_length=max_length, min_length=30, do_sample=False)
+    
+    return summary[0]['summary_text']
+
 def create_raptor_index(embeddings, chunks):
     gmm = GaussianMixture(n_components=10, covariance_type='full', random_state=42)
     gmm.fit(embeddings)
@@ -101,47 +58,77 @@ def create_raptor_index(embeddings, chunks):
     summarized_clusters = []
     for cluster in set(cluster_labels):
         cluster_texts = [chunks[i] for i in range(len(chunks)) if cluster_labels[i] == cluster]
+        
+        if not cluster_texts:
+            continue  # Skip empty clusters
+        
         summary = summarize_cluster(cluster_texts)
         summarized_clusters.append(summary)
     
-    summarized_embeddings = embed_chunks(summarized_clusters)
+    summarized_embeddings = model.encode(summarized_clusters)
     return summarized_embeddings, summarized_clusters
 
-def store_in_milvus(embeddings, texts, metadata):
-    connections.connect(host='localhost', port='19530')
-
-    fields = [
-        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=384),
-        FieldSchema(name="text", dtype=DataType.STRING),
-        FieldSchema(name="metadata", dtype=DataType.JSON)
-    ]
-    schema = CollectionSchema(fields, "RAPTOR Index")
-    collection = Collection(name="raptor_index", schema=schema)
+def hybrid_retrieval(query, faiss_results, texts, top_k=10):
+    cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+    cross_encoder_scores = cross_encoder.predict([(query, text) for text in texts])
     
-    entities = [
-        embeddings.tolist(),
-        texts,
-        metadata
+    # Combine FAISS scores (distances) with cross-encoder scores
+    combined_results = [
+        (i, 1 / (1 + dist) * 0.5 + cross_encoder_score * 0.5)
+        for i, (dist, cross_encoder_score) in enumerate(zip(faiss_results[1][0], cross_encoder_scores))
     ]
-    collection.insert(entities)
+    
+    # Sort by combined score
+    sorted_results = sorted(combined_results, key=lambda x: x[1], reverse=True)
+    return sorted_results[:top_k]
 
-def embed_chunks(chunks):
-    embeddings = []
-    for chunk in chunks:
-        response = client.embeddings.create(
-            model="text-embedding-ada-002",
-            input=chunk
-        )
-        embeddings.append(response.data[0].embedding)
-    return np.array(embeddings)
+def retrieve_from_faiss(index, query_embedding, k=10):
+    return index.search(query_embedding.astype('float32').reshape(1, -1), k)
 
+def load_and_process_data(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        chunks = f.readlines()
+    embeddings = np.load(file_path.replace('_chunks.txt', '_embeddings.npy'))
+    summarized_embeddings, summarized_clusters = create_raptor_index(embeddings, chunks)
+    metadata = [{"title": file_path, "page": i} for i in range(len(summarized_clusters))]
+    return summarized_embeddings, summarized_clusters, metadata
 
 if __name__ == "__main__":
-    texts = ['data/textbook1_chunks.txt', 'data/textbook2_chunks.txt', 'data/textbook3_chunks.txt']
-    for text_file in texts:
-        with open(text_file, 'r', encoding='utf-8') as f:
-            chunks = f.readlines()
-        embeddings = np.load(text_file.replace('_chunks.txt', '_embeddings.npy'))
-        summarized_embeddings, summarized_clusters = create_raptor_index(embeddings, chunks)
-        metadata = [{"title": text_file, "page": i} for i in range(len(chunks))]
-        store_in_milvus(summarized_embeddings, summarized_clusters, metadata)
+    try:
+        print(f"Current working directory: {os.getcwd()}")
+
+        all_embeddings = []
+        all_texts = []
+        all_metadata = []
+
+        # Indexing
+        text_files = ['data/textbook1_chunks.txt', 'data/textbook2_chunks.txt', 'data/textbook3_chunks.txt']
+        for text_file in text_files:
+            embeddings, texts, metadata = load_and_process_data(text_file)
+            all_embeddings.append(embeddings)
+            all_texts.extend(texts)
+            all_metadata.extend(metadata)
+
+        # Combine all embeddings
+        combined_embeddings = np.vstack(all_embeddings)
+
+        # Create FAISS index
+        faiss_index = create_faiss_index(combined_embeddings)
+
+        # Example query and retrieval
+        query = "What is the main idea of chapter 5?"
+        query_embedding = model.encode([query])[0]
+        faiss_results = retrieve_from_faiss(faiss_index, query_embedding)
+        
+        hybrid_results = hybrid_retrieval(query, faiss_results, all_texts)
+        
+        print(f"Query: {query}")
+        print("\nResults:")
+        for i, (idx, score) in enumerate(hybrid_results, 1):
+            print(f"\n{i}. Text: {all_texts[idx][:100]}...")  # Print first 100 characters of text
+            print(f"   Combined Score: {score}")
+            print(f"   Metadata: {all_metadata[idx]}")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        traceback.print_exc()

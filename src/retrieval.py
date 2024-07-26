@@ -1,82 +1,101 @@
-from sentence_transformers import CrossEncoder, SentenceTransformer
-import numpy as np
-from pymilvus import Collection, connections
 import os
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from dotenv import load_dotenv
 
 # Load environment variables
 dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
 load_dotenv(dotenv_path)
 
-# Connect to Milvus
-connections.connect(host='localhost', port='19530')
+# Initialize models
+model = SentenceTransformer('all-MiniLM-L6-v2')
+cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
 
-def bm25_retrieval(query, top_k=10):
-    # Placeholder for BM25 implementation. You need to replace this with actual BM25 retrieval logic.
-    # For now, we'll just return some dummy results
-    return [{"text": f"Sample text {i} from BM25 result."} for i in range(top_k)]
+def create_faiss_index(embeddings):
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(embeddings.astype('float32'))
+    return index
 
-def hybrid_retrieval(query, top_k=10):
-    bm25_results = bm25_retrieval(query, top_k)
-    cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-    scores = cross_encoder.predict([(query, result['text']) for result in bm25_results])
-    sorted_results = sorted(zip(bm25_results, scores), key=lambda x: x[1], reverse=True)
+def load_or_create_faiss_index(index_path, text_files):
+    if os.path.exists(index_path):
+        print(f"Loading existing index from {index_path}")
+        return faiss.read_index(index_path)
+    else:
+        print(f"Creating new index and saving to {index_path}")
+        all_embeddings = []
+        for file_path in text_files:
+            embeddings = np.load(file_path.replace('_chunks.txt', '_embeddings.npy'))
+            all_embeddings.append(embeddings)
+        combined_embeddings = np.vstack(all_embeddings)
+        index = create_faiss_index(combined_embeddings)
+        faiss.write_index(index, index_path)
+        return index
+
+def retrieve_from_faiss(index, query_embedding, k=10):
+    return index.search(query_embedding.astype('float32').reshape(1, -1), k)
+
+def hybrid_retrieval(query, faiss_results, texts, top_k=10):
+    cross_encoder_scores = cross_encoder.predict([(query, text) for text in texts])
+    
+    combined_results = [
+        (i, 1 / (1 + dist) * 0.5 + cross_encoder_score * 0.5)
+        for i, (dist, cross_encoder_score) in enumerate(zip(faiss_results[1][0], cross_encoder_scores))
+    ]
+    
+    sorted_results = sorted(combined_results, key=lambda x: x[1], reverse=True)
     return sorted_results[:top_k]
 
-def retrieve_from_milvus(query_embedding, top_k=10):
-    collection = Collection("raptor_index")
-    collection.load()
-    search_params = {"metric_type": "L2", "params": {"nprobe": 10}}
-    results = collection.search(
-        data=[query_embedding.tolist()],
-        anns_field="embedding",
-        param=search_params,
-        limit=top_k,
-        expr=None,
-        output_fields=["text", "metadata"]
-    )
-    return results
+def load_texts_and_metadata(file_paths):
+    all_texts = []
+    all_metadata = []
+    for file_path in file_paths:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            texts = f.readlines()
+        all_texts.extend(texts)
+        metadata = [{"title": file_path, "page": i} for i in range(len(texts))]
+        all_metadata.extend(metadata)
+    return all_texts, all_metadata
 
-def process_milvus_results(results):
-    processed_results = []
-    for hit in results[0]:
-        processed_results.append({
-            'id': hit.id,
-            'distance': hit.distance,
-            'text': hit.entity.get('text'),
-            'metadata': hit.entity.get('metadata')
-        })
-    return processed_results
-
-def retrieve(query, top_k=10):
+def retrieve(query, index_path, text_files, top_k=10):
+    # Load or create FAISS index
+    faiss_index = load_or_create_faiss_index(index_path, text_files)
+    
+    # Load texts and metadata
+    all_texts, all_metadata = load_texts_and_metadata(text_files)
+    
     # Encode query
-    model = SentenceTransformer('all-MiniLM-L6-v2')
     query_embedding = model.encode([query])[0]
 
-    # Retrieve from Milvus
-    milvus_results = retrieve_from_milvus(query_embedding, top_k)
-    processed_milvus_results = process_milvus_results(milvus_results)
-
+    # Retrieve from FAISS
+    faiss_results = retrieve_from_faiss(faiss_index, query_embedding, top_k)
+    
     # Perform hybrid retrieval
-    hybrid_results = hybrid_retrieval(query, top_k)
+    hybrid_results = hybrid_retrieval(query, faiss_results, all_texts, top_k)
 
-    # Combine results (you might want to implement a more sophisticated combination strategy)
-    combined_results = processed_milvus_results + [item[0] for item in hybrid_results]
+    # Process results
+    results = []
+    for i, (idx, score) in enumerate(hybrid_results):
+        results.append({
+            'text': all_texts[idx],
+            'score': score,
+            'metadata': all_metadata[idx]
+        })
 
-    # Deduplicate and sort (assuming you have a way to compare and sort the combined results)
-    # This is a simple example, you might need a more complex sorting strategy
-    deduplicated_results = list({r['text']: r for r in combined_results}.values())
-    sorted_results = sorted(deduplicated_results, key=lambda x: x.get('distance', float('inf')))
-
-    return sorted_results[:top_k]
+    return results
 
 if __name__ == "__main__":
+    # Paths to your index and text files
+    index_path = 'faiss_index.index'
+    text_files = ['data/textbook1_chunks.txt', 'data/textbook2_chunks.txt', 'data/textbook3_chunks.txt']
+    
     query = "What is the main idea of chapter 5?"
-    results = retrieve(query)
+    results = retrieve(query, index_path, text_files)
 
     print(f"Query: {query}")
     print("\nResults:")
     for i, result in enumerate(results, 1):
         print(f"\n{i}. Text: {result['text'][:100]}...")  # Print first 100 characters of text
-        print(f"   Distance: {result.get('distance', 'N/A')}")
-        print(f"   Metadata: {result.get('metadata', 'N/A')}")
+        print(f"   Combined Score: {result['score']}")
+        print(f"   Metadata: {result['metadata']}")
